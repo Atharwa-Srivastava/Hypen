@@ -58,12 +58,21 @@ async function setupSocketRedisAdapter(io, redisUrl) {
   const { createClient } = require("redis");
   const pub = createClient({
     url: redisUrl,
-    socket: { reconnectStrategy: (retries) => Math.min(retries * 100, 3000) },
+    socket: {
+      connectTimeout: 5000,
+      reconnectStrategy: (retries) => {
+        if (retries > 3) return new Error("Redis connection retry limit reached");
+        return Math.min(retries * 100, 1000);
+      },
+    },
   });
   const sub = pub.duplicate();
   pub.on("error", (e) => console.warn("Redis pub error:", e.message));
   sub.on("error", (e) => console.warn("Redis sub error:", e.message));
-  await Promise.all([pub.connect(), sub.connect()]);
+  await Promise.race([
+    Promise.all([pub.connect(), sub.connect()]),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("Redis connection timed out after 5s")), 5000)),
+  ]);
   io.adapter(createAdapter(pub, sub));
   console.log("Socket.IO Redis adapter enabled");
   return { pub, sub };
@@ -155,7 +164,9 @@ function registerGlobalErrorHandlers(app) {
 }
 
 function runCluster(startWorker) {
-  const workers = Number(process.env.CLUSTER_WORKERS || os.cpus().length);
+  const isContainer = Boolean(process.env.K_SERVICE || process.env.PORT);
+  const defaultWorkers = isContainer ? 1 : os.cpus().length;
+  const workers = Number(process.env.CLUSTER_WORKERS || defaultWorkers);
   if (workers <= 1) {
     startWorker();
     return;

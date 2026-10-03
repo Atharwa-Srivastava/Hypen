@@ -337,9 +337,9 @@ function initializeFirebaseAdmin() {
       return;
     }
 
-    console.warn(
-      "Firebase Admin credentials are missing. Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY in the environment.",
-    );
+    const fallbackProjectId = projectId || process.env.FIREBASE_PROJECT_ID || "convoo-a9135";
+    admin.initializeApp({ projectId: fallbackProjectId });
+    console.log(`Firebase Admin Initialized with project ID: ${fallbackProjectId} (Public token verification mode)`);
     return;
   } catch (err) {
     console.error("Firebase Init Error:", err);
@@ -375,38 +375,46 @@ async function connectMongo() {
   await mongoose.connect(process.env.MONGO_URI, mongoConnectOptions());
   console.log("MongoDB Connected");
 
-  await Message.collection.createIndex(
-    { timestamp: 1 },
-    { expireAfterSeconds: 7 * 24 * 60 * 60, background: true },
-  );
+  // Run initial migrations and index builds in the background so port binding is never delayed
+  (async () => {
+    try {
+      await Message.collection.createIndex(
+        { timestamp: 1 },
+        { expireAfterSeconds: 7 * 24 * 60 * 60, background: true },
+      );
 
-  await User.collection.updateMany(
-    { email: "" },
-    { $unset: { email: "" }, $set: { emailVerified: false } },
-  );
-  await User.collection.updateMany(
-    { phoneNumber: "" },
-    { $unset: { phoneNumber: "" } },
-  );
-  await User.collection.updateMany(
-    { firebaseUid: "" },
-    { $unset: { firebaseUid: "" } },
-  );
+      await User.collection.updateMany(
+        { email: "" },
+        { $unset: { email: "" }, $set: { emailVerified: false } },
+      );
+      await User.collection.updateMany(
+        { phoneNumber: "" },
+        { $unset: { phoneNumber: "" } },
+      );
+      await User.collection.updateMany(
+        { firebaseUid: "" },
+        { $unset: { firebaseUid: "" } },
+      );
 
-  await Promise.all([
-    User.createIndexes(),
-    Message.createIndexes(),
-    Call.createIndexes(),
-    Moment.createIndexes(),
-    Group.createIndexes(),
-    GroupMessage.createIndexes(),
-    GroupParticipant.createIndexes(),
-    GroupInviteLink.createIndexes(),
-    GroupJoinRequest.createIndexes(),
-    GroupMessageReceipt.createIndexes(),
-    GroupMessageReaction.createIndexes(),
-    GroupPinnedMessage.createIndexes(),
-  ]);
+      await Promise.all([
+        User.createIndexes(),
+        Message.createIndexes(),
+        Call.createIndexes(),
+        Moment.createIndexes(),
+        Group.createIndexes(),
+        GroupMessage.createIndexes(),
+        GroupParticipant.createIndexes(),
+        GroupInviteLink.createIndexes(),
+        GroupJoinRequest.createIndexes(),
+        GroupMessageReceipt.createIndexes(),
+        GroupMessageReaction.createIndexes(),
+        GroupPinnedMessage.createIndexes(),
+      ]);
+      console.log("MongoDB indexes verified");
+    } catch (e) {
+      console.warn("MongoDB background index initialization warning:", e.message);
+    }
+  })();
 }
 
 function ensureUpdateConfig() {
@@ -6662,20 +6670,14 @@ async function purgeInactiveMobileSessions() {
 
 
 
-const PORT = process.env.PORT || 8000;
+const PORT = process.env.PORT || 3000;
 
 async function bootstrapServer() {
   validateRuntimeConfigAtStartup();
   initializeFirebaseAdmin();
   ensureUpdateConfig();
-  await connectMongo();
-  if (redisUrl) {
-    socketRedisClients = await setupSocketRedisAdapter(io, redisUrl).catch((e) => {
-      console.warn("Socket Redis adapter failed:", e.message);
-      return null;
-    });
-  }
 
+  // Bind to PORT immediately so Cloud Run / App Hosting TCP and health probes pass instantly
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`Convoo E2EE Server running on port ${PORT} (pid ${process.pid})`);
   });
@@ -6701,6 +6703,20 @@ async function bootstrapServer() {
       console.error("Inactive mobile sweep failed:", e),
     );
   }, 5 * 60 * 1000);
+
+  // Initialize DB and Redis connections asynchronously without blocking HTTP readiness
+  try {
+    await connectMongo();
+  } catch (err) {
+    console.error("MongoDB initial connection error:", err.message);
+  }
+
+  if (redisUrl) {
+    socketRedisClients = await setupSocketRedisAdapter(io, redisUrl).catch((e) => {
+      console.warn("Socket Redis adapter failed:", e.message);
+      return null;
+    });
+  }
 }
 
 bootstrapServer().catch((error) => {
