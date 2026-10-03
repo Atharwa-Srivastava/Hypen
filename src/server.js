@@ -12,10 +12,27 @@ const Razorpay = require("razorpay");
 const { rateLimit, ipKeyGenerator } = require("express-rate-limit");
 const { RedisStore } = require("rate-limit-redis");
 const { createClient } = require("redis");
+const {
+  mongoConnectOptions,
+  applySecurityMiddleware,
+  createRequestGuards,
+  registerHealthRoutes,
+  createSocketPacketLimiter,
+  setupSocketRedisAdapter,
+  registerGracefulShutdown,
+  registerGlobalErrorHandlers,
+} = require("./lib/hardening");
+const sessionCache = require("./services/session-cache");
 
 const app = express();
 app.set("trust proxy", 1);
+app.disable("x-powered-by");
 const server = http.createServer(app);
+server.headersTimeout = Number(process.env.HEADERS_TIMEOUT_MS || 65000);
+server.requestTimeout = Number(process.env.REQUEST_TIMEOUT_MS || 60000);
+server.keepAliveTimeout = Number(process.env.KEEP_ALIVE_TIMEOUT_MS || 5000);
+server.maxHeadersCount = Number(process.env.MAX_HEADERS_COUNT || 100);
+server.maxRequestsPerSocket = Number(process.env.MAX_REQUESTS_PER_SOCKET || 1000);
 const Message = require("./models/Message");
 const GhostId = require("./models/GhostId");
 const User = require("./models/User");
@@ -58,7 +75,7 @@ const {
 const admin = require("firebase-admin");
 
 const UPDATE_CONFIG_PATH = path.join(__dirname, "./config/update-config.json");
-const UPDATE_API_KEY = process.env.UPDATE_API_KEY || "CHANGE_ME_UPDATE_API_KEY";
+const UPDATE_API_KEY = process.env.UPDATE_API_KEY || "";
 const CHANGE_CHAT_ID_PRICES = {
   random: 59,
   custom: 99,
@@ -86,13 +103,15 @@ const allowedOrigins = (process.env.CORS_ORIGINS || "")
   .filter(Boolean);
 const redisUrl = String(process.env.REDIS_URL || "").trim();
 const useRedisRateLimit =
-  redisUrl && process.env.USE_REDIS_RATE_LIMIT === "true";
+  Boolean(redisUrl) &&
+  String(process.env.USE_REDIS_RATE_LIMIT || "true").toLowerCase() !== "false";
 let redisClient = null;
+let socketRedisClients = null;
 if (useRedisRateLimit) {
   redisClient = createClient({
     url: redisUrl,
     socket: {
-      reconnectStrategy: false,
+      reconnectStrategy: (retries) => Math.min(retries * 100, 3000),
     },
   });
   redisClient.on("error", (error) => {
@@ -126,6 +145,11 @@ const io = socketIo(server, {
     },
     credentials: true,
   },
+  pingTimeout: Number(process.env.SOCKET_PING_TIMEOUT_MS || 20000),
+  pingInterval: Number(process.env.SOCKET_PING_INTERVAL_MS || 10000),
+  maxHttpBufferSize: Number(process.env.SOCKET_MAX_BUFFER || 1e6),
+  connectTimeout: Number(process.env.SOCKET_CONNECT_TIMEOUT_MS || 45000),
+  perMessageDeflate: { threshold: 1024 },
 });
 
 function makeRateLimiter({ windowMs, max, keyPrefix }) {
@@ -135,6 +159,7 @@ function makeRateLimiter({ windowMs, max, keyPrefix }) {
     standardHeaders: true,
     legacyHeaders: false,
     passOnStoreError: true,
+    skip: (req) => req.path === "/health" || req.path === "/ready",
     keyGenerator: (req) => {
       const ip = ipKeyGenerator(
         req.ip || req.connection?.remoteAddress || "unknown",
@@ -176,12 +201,128 @@ const chatIdAvailabilityRateLimiter = makeRateLimiter({
   max: 20,
   keyPrefix: "chatid_availability",
 });
+const apiRateLimiter = makeRateLimiter({
+  windowMs: 60 * 1000,
+  max: Number(process.env.API_RATE_LIMIT_PER_MINUTE || 300),
+  keyPrefix: "api",
+});
+const uploadRateLimiter = makeRateLimiter({
+  windowMs: 60 * 1000,
+  max: Number(process.env.UPLOAD_RATE_LIMIT_PER_MINUTE || 30),
+  keyPrefix: "upload",
+});
+const authRateLimiter = makeRateLimiter({
+  windowMs: 60 * 1000,
+  max: Number(process.env.AUTH_RATE_LIMIT_PER_MINUTE || 20),
+  keyPrefix: "auth",
+});
+const messageSendRateLimiter = makeRateLimiter({
+  windowMs: 60 * 1000,
+  max: Number(process.env.MESSAGE_SEND_RATE_LIMIT_PER_MINUTE || 120),
+  keyPrefix: "message_send",
+});
+const groupMutationRateLimiter = makeRateLimiter({
+  windowMs: 60 * 1000,
+  max: Number(process.env.GROUP_MUTATION_RATE_LIMIT_PER_MINUTE || 60),
+  keyPrefix: "group_mutation",
+});
+const momentWriteRateLimiter = makeRateLimiter({
+  windowMs: 60 * 1000,
+  max: Number(process.env.MOMENT_WRITE_RATE_LIMIT_PER_MINUTE || 60),
+  keyPrefix: "moment_write",
+});
+
+function authChatId(req) {
+  return normalizeChatId(req.auth?.chatId || req.user?.chatId || "");
+}
+
+function requireSelfChatId(req, res, suppliedChatId, label = "chatId") {
+  const ownChatId = authChatId(req);
+  const requestedChatId = normalizeChatId(suppliedChatId);
+  if (!ownChatId) {
+    res.status(401).json({ error: "Authenticated user required" });
+    return null;
+  }
+  if (!requestedChatId) {
+    res.status(400).json({ error: `${label} is required` });
+    return null;
+  }
+  if (requestedChatId !== ownChatId) {
+    res.status(403).json({ error: "Forbidden" });
+    return null;
+  }
+  return ownChatId;
+}
+
+function requireActor(req, res, suppliedActorId = null) {
+  const ownChatId = authChatId(req);
+  const claimedActorId = normalizeChatId(suppliedActorId || ownChatId);
+  if (!ownChatId) {
+    res.status(401).json({ error: "Authenticated user required" });
+    return null;
+  }
+  if (claimedActorId && claimedActorId !== ownChatId) {
+    res.status(403).json({ error: "Actor does not match authenticated user" });
+    return null;
+  }
+  return ownChatId;
+}
+
+function boundedString(value, maxLength) {
+  return String(value || "").trim().slice(0, maxLength);
+}
+
+function boundedChatIdList(values, maxItems = 500) {
+  return [
+    ...new Set(
+      (Array.isArray(values) ? values : [])
+        .map((value) => normalizeChatId(value))
+        .filter(Boolean),
+    ),
+  ].slice(0, maxItems);
+}
+
+function groupRole(group, chatId) {
+  if (!group || !chatId) return "none";
+  if (group.ownerId === chatId) return "owner";
+  if (Array.isArray(group.admins) && group.admins.includes(chatId)) return "admin";
+  if (Array.isArray(group.coAdmins) && group.coAdmins.includes(chatId)) return "co_admin";
+  if (Array.isArray(group.members) && group.members.includes(chatId)) return "member";
+  return "none";
+}
+
+function isGroupMember(group, chatId) {
+  return groupRole(group, chatId) !== "none";
+}
+
+function hasGroupPermission(group, chatId, scope = "admins") {
+  const role = groupRole(group, chatId);
+  if (role === "owner") return true;
+  if (scope === "all") return role !== "none";
+  if (scope === "members") return role !== "none";
+  if (scope === "admins") return role === "admin";
+  if (scope === "co_admins") return role === "admin" || role === "co_admin";
+  if (scope === "owner") return false;
+  return role === "admin";
+}
+
+function parsePositiveInt(value, fallback, max) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, max);
+}
+
+function setPrivateCache(res, seconds = 15) {
+  res.setHeader(
+    "Cache-Control",
+    `private, max-age=${seconds}, stale-while-revalidate=${seconds * 4}`,
+  );
+}
 
 function initializeFirebaseAdmin() {
   const projectId = process.env.FIREBASE_PROJECT_ID;
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
   const privateKey = process.env.FIREBASE_PRIVATE_KEY;
-  const serviceAccountPath = path.join(__dirname, "..", "serviceAccountKey.json");
 
   try {
     if (projectId && clientEmail && privateKey) {
@@ -196,19 +337,8 @@ function initializeFirebaseAdmin() {
       return;
     }
 
-    if (fs.existsSync(serviceAccountPath)) {
-      const serviceAccount = JSON.parse(
-        fs.readFileSync(serviceAccountPath, "utf8"),
-      );
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-      });
-      console.log("Firebase Admin Initialized from serviceAccountKey.json");
-      return;
-    }
-
     console.warn(
-      "Firebase Admin credentials are missing. Push notifications and mobile auth verification will stay disabled.",
+      "Firebase Admin credentials are missing. Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY in the environment.",
     );
     return;
   } catch (err) {
@@ -242,7 +372,7 @@ async function connectMongo() {
     throw new Error("MONGO_URI is missing");
   }
 
-  await mongoose.connect(process.env.MONGO_URI);
+  await mongoose.connect(process.env.MONGO_URI, mongoConnectOptions());
   console.log("MongoDB Connected");
 
   await Message.collection.createIndex(
@@ -265,7 +395,9 @@ async function connectMongo() {
 
   await Promise.all([
     User.createIndexes(),
+    Message.createIndexes(),
     Call.createIndexes(),
+    Moment.createIndexes(),
     Group.createIndexes(),
     GroupMessage.createIndexes(),
     GroupParticipant.createIndexes(),
@@ -339,9 +471,21 @@ function writeUpdateConfig(next) {
   );
 }
 
+function isValidUpdateApiKey(supplied) {
+  if (!UPDATE_API_KEY || !supplied) {
+    return false;
+  }
+  const expected = Buffer.from(String(UPDATE_API_KEY));
+  const actual = Buffer.from(String(supplied));
+  return (
+    expected.length === actual.length &&
+    crypto.timingSafeEqual(expected, actual)
+  );
+}
+
 function requireUpdateApiKey(req, res, next) {
   const supplied = req.header("x-api-key") || req.query.key;
-  if (!supplied || supplied !== UPDATE_API_KEY) {
+  if (!isValidUpdateApiKey(supplied)) {
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
@@ -450,6 +594,45 @@ async function clearUserCommunicationHistory(chatId) {
   await Call.deleteMany({
     $or: [{ caller: normalizedChatId }, { receiver: normalizedChatId }],
   });
+}
+
+async function resetAuthStateForMobileRelogin(userId, nextDeviceId) {
+  const normalizedDeviceId = String(nextDeviceId || "").trim();
+  const existingDevices = await Device.find({ userId }).select("deviceId").lean();
+  const deviceIds = [
+    ...new Set(
+      existingDevices
+        .map((device) => String(device.deviceId || "").trim())
+        .filter(Boolean),
+    ),
+  ];
+  const sessionDeviceIds = [
+    ...new Set([...deviceIds, normalizedDeviceId].filter(Boolean)),
+  ];
+  const authSessionFilters = [{ userId }];
+  if (sessionDeviceIds.length > 0) {
+    authSessionFilters.push({ deviceId: { $in: sessionDeviceIds } });
+  }
+
+  await Promise.all([
+    AuthSession.deleteMany({ $or: authSessionFilters }),
+    Device.updateMany(
+      { userId },
+      {
+        $set: {
+          isActive: false,
+          socketId: null,
+          fcmToken: null,
+          lastActive: new Date(),
+        },
+        $inc: {
+          tokenVersion: 1,
+        },
+      },
+    ),
+  ]);
+
+  return deviceIds;
 }
 
 function generateGroupId() {
@@ -587,7 +770,7 @@ async function purgeExpiredGhostSessions() {
       { expiresAt: { $lte: now } },
       { isActive: false },
     ],
-  });
+  }).limit(Number(process.env.GHOST_PURGE_BATCH_SIZE || 500));
 
   for (const g of expired) {
     try {
@@ -1050,6 +1233,10 @@ async function attachAuthenticatedSocket(socket) {
   if (!auth?.chatId || !auth?.deviceId) {
     return;
   }
+  if (socket.data.authAttached) {
+    return;
+  }
+  socket.data.authAttached = true;
   socket.data.chatId = auth.chatId;
   socket.data.deviceId = auth.deviceId;
   socket.join(auth.chatId);
@@ -1509,7 +1696,9 @@ app.post(
         .createHmac("sha256", razorpayWebhookSecret)
         .update(req.body)
         .digest("hex");
-      if (String(signature) !== expected) {
+      const expectedBuffer = Buffer.from(expected, "hex");
+      const signatureBuffer = Buffer.from(String(signature || ""), "hex");
+      if (expectedBuffer.length !== signatureBuffer.length || !crypto.timingSafeEqual(expectedBuffer, signatureBuffer)) {
         return res.status(400).json({ error: "Invalid webhook signature" });
       }
 
@@ -1551,7 +1740,6 @@ app.post(
     }
   },
 );
-app.use(express.json());
 app.use(
   cors({
     origin: (origin, callback) => {
@@ -1564,7 +1752,27 @@ app.use(
     credentials: true,
   }),
 );
-app.use("/uploads", express.static(path.join(__dirname, "../uploads")));
+applySecurityMiddleware(app);
+const healthState = {
+  mongoose,
+  isShuttingDown: () => false,
+  redisOk: () => redisClient?.isOpen || Boolean(socketRedisClients?.pub?.isOpen),
+};
+registerHealthRoutes(app, healthState);
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "1mb" }));
+app.use(express.urlencoded({ extended: false, limit: process.env.JSON_BODY_LIMIT || "1mb" }));
+app.use(createRequestGuards());
+app.use(apiRateLimiter);
+app.use(
+  "/uploads",
+  express.static(path.join(__dirname, "../uploads"), {
+    maxAge: "30d",
+    immutable: true,
+    setHeaders: (res) => {
+      res.setHeader("X-Content-Type-Options", "nosniff");
+    },
+  }),
+);
 
 // ── Multer Storage Configuration ───────────────────────────────────────────
 const storage = multer.diskStorage({
@@ -1652,16 +1860,16 @@ const apkUpload = multer({
 
 app.get("/", (req, res) => res.send("Convoo Server Running 🚀 (E2EE)"));
 
-app.post("/groups/create", async (req, res) => {
+app.post("/groups/create", requireAuth, groupMutationRateLimiter, async (req, res) => {
   try {
-    const ownerId = normalizeChatId(req.body.ownerId);
-    const name = String(req.body.name || "").trim();
-    const description = String(req.body.description || "").trim();
+    const ownerId = requireActor(req, res, req.body.ownerId);
+    if (!ownerId) return;
+    const name = boundedString(req.body.name, 100);
+    const description = boundedString(req.body.description, 1024);
     const profilePhoto = String(req.body.profilePhoto || "").trim();
-    const membersRaw = Array.isArray(req.body.members) ? req.body.members : [];
-    const members = [...new Set(membersRaw.map((m) => normalizeChatId(m)).filter(Boolean))];
-    if (!ownerId || !name) {
-      return res.status(400).json({ error: "ownerId and name are required" });
+    const members = boundedChatIdList(req.body.members, 256);
+    if (!name) {
+      return res.status(400).json({ error: "Group name is required" });
     }
     if (!members.includes(ownerId)) members.unshift(ownerId);
     if (members.some((m) => m.startsWith(GHOST_PREFIX))) {
@@ -1748,9 +1956,10 @@ app.post("/groups/create", async (req, res) => {
   }
 });
 
-app.get("/groups/:chatId", async (req, res) => {
+app.get("/groups/:chatId", requireAuth, async (req, res) => {
   try {
-    const chatId = normalizeChatId(req.params.chatId);
+    const chatId = requireSelfChatId(req, res, req.params.chatId);
+    if (!chatId) return;
     const groups = await Group.find({ members: chatId }).sort({ createdAt: -1 });
     return res.json(groups);
   } catch (e) {
@@ -1758,32 +1967,38 @@ app.get("/groups/:chatId", async (req, res) => {
   }
 });
 
-app.get("/groups/detail/:groupId", async (req, res) => {
+app.get("/groups/detail/:groupId", requireAuth, async (req, res) => {
   try {
+    const actorId = authChatId(req);
     const group = await Group.findOne({ groupId: req.params.groupId });
     if (!group) return res.status(404).json({ error: "Group not found" });
+    if (!isGroupMember(group, actorId)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
     return res.json(group);
   } catch (e) {
     return res.status(500).json({ error: "Failed to fetch group" });
   }
 });
 
-app.get("/groups/messages/:groupId", async (req, res) => {
+app.get("/groups/messages/:groupId", requireAuth, async (req, res) => {
   try {
-    // Plaintext group message history is disabled.
-    // Group chat uses E2EE fan-out via /send (per-device encrypted payloads),
-    // and history lives only on devices.
-    return res.status(410).json({
-      error: "Group plaintext history disabled (E2EE only)",
-      code: "group_plaintext_disabled",
-      messages: [],
-    });
+    const actorId = authChatId(req);
+    const group = await Group.findOne({ groupId: req.params.groupId });
+    if (!group) return res.status(404).json({ error: "Group not found" });
+    if (!isGroupMember(group, actorId)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    const messages = await GroupMessage.find({ groupId: req.params.groupId })
+      .sort({ timestamp: 1 })
+      .limit(200);
+    return res.json(messages);
   } catch (e) {
     return res.status(500).json({ error: "Failed to fetch group messages" });
   }
 });
 
-app.post("/groups/send", async (req, res) => {
+app.post("/groups/send", requireAuth, groupMutationRateLimiter, async (req, res) => {
   try {
     // Plaintext group messages are disabled (E2EE only).
     // Use /send with encrypted payloads and include groupId metadata.
@@ -1796,9 +2011,11 @@ app.post("/groups/send", async (req, res) => {
   }
 });
 
-app.post("/groups/update-settings", async (req, res) => {
+app.post("/groups/update-settings", requireAuth, groupMutationRateLimiter, async (req, res) => {
   try {
-    const { groupId, actorId, settings } = req.body;
+    const { groupId, settings } = req.body;
+    const actorId = requireActor(req, res, req.body.actorId);
+    if (!actorId) return;
     const group = await Group.findOne({ groupId });
     if (!group) return res.status(404).json({ error: "Group not found" });
     if (!(group.ownerId === actorId || group.admins.includes(actorId))) {
@@ -1816,17 +2033,16 @@ app.post("/groups/update-settings", async (req, res) => {
   }
 });
 
-app.post("/groups/add-members", async (req, res) => {
+app.post("/groups/add-members", requireAuth, groupMutationRateLimiter, async (req, res) => {
   try {
-    const { groupId, actorId, members } = req.body;
+    const { groupId } = req.body;
+    const actorId = requireActor(req, res, req.body.actorId);
+    if (!actorId) return;
     const group = await Group.findOne({ groupId });
     if (!group) return res.status(404).json({ error: "Group not found" });
-    const canAdd =
-      group.settings?.addMembers === "all" ||
-      group.ownerId === actorId ||
-      group.admins.includes(actorId);
+    const canAdd = hasGroupPermission(group, actorId, group.settings?.addMembers || "admins");
     if (!canAdd) return res.status(403).json({ error: "No permission to add members" });
-    const normalized = [...new Set((Array.isArray(members) ? members : []).map((m) => normalizeChatId(m)).filter(Boolean))];
+    const normalized = boundedChatIdList(req.body.members, 256);
     if (normalized.some((m) => m.startsWith(GHOST_PREFIX))) {
       return res.status(400).json({ error: "Ghost IDs cannot be added to groups" });
     }
@@ -1875,15 +2091,16 @@ app.post("/groups/add-members", async (req, res) => {
   }
 });
 
-app.post("/groups/invite-link", async (req, res) => {
+app.post("/groups/invite-link", requireAuth, groupMutationRateLimiter, async (req, res) => {
   try {
-    const { groupId, actorId } = req.body;
+    const { groupId } = req.body;
+    const actorId = requireActor(req, res, req.body.actorId);
+    if (!actorId) return;
     const group = await Group.findOne({ groupId });
     if (!group) return res.status(404).json({ error: "Group not found" });
     const canInvite =
-      group.ownerId === actorId ||
-      group.admins.includes(actorId) ||
-      group.members.includes(actorId);
+      group.settings?.allowInviteLinks !== false &&
+      hasGroupPermission(group, actorId, "members");
     if (!canInvite) return res.status(403).json({ error: "No permission to invite" });
 
     const token = generateInviteToken();
@@ -1927,10 +2144,11 @@ app.get("/groups/invite/:token", async (req, res) => {
   }
 });
 
-app.post("/groups/join-invite", async (req, res) => {
+app.post("/groups/join-invite", requireAuth, groupMutationRateLimiter, async (req, res) => {
   try {
-    const { token, chatId } = req.body;
-    const memberId = normalizeChatId(chatId);
+    const { token } = req.body;
+    const memberId = requireSelfChatId(req, res, req.body.chatId);
+    if (!memberId) return;
     const invite = await GroupInviteLink.findOne({
       tokenHash: hashInviteToken(token),
       status: "active",
@@ -1985,9 +2203,12 @@ app.post("/groups/join-invite", async (req, res) => {
   }
 });
 
-app.post("/groups/remove-member", async (req, res) => {
+app.post("/groups/remove-member", requireAuth, groupMutationRateLimiter, async (req, res) => {
   try {
-    const { groupId, actorId, memberId } = req.body;
+    const { groupId } = req.body;
+    const actorId = requireActor(req, res, req.body.actorId);
+    if (!actorId) return;
+    const memberId = normalizeChatId(req.body.memberId);
     const group = await Group.findOne({ groupId });
     if (!group) return res.status(404).json({ error: "Group not found" });
     if (group.ownerId === memberId) {
@@ -2030,9 +2251,12 @@ app.post("/groups/remove-member", async (req, res) => {
   }
 });
 
-app.post("/groups/promote-admin", async (req, res) => {
+app.post("/groups/promote-admin", requireAuth, groupMutationRateLimiter, async (req, res) => {
   try {
-    const { groupId, actorId, memberId } = req.body;
+    const { groupId } = req.body;
+    const actorId = requireActor(req, res, req.body.actorId);
+    if (!actorId) return;
+    const memberId = normalizeChatId(req.body.memberId);
     const group = await Group.findOne({ groupId });
     if (!group) return res.status(404).json({ error: "Group not found" });
     if (group.ownerId !== actorId) {
@@ -2064,9 +2288,12 @@ app.post("/groups/promote-admin", async (req, res) => {
   }
 });
 
-app.post("/groups/demote-admin", async (req, res) => {
+app.post("/groups/demote-admin", requireAuth, groupMutationRateLimiter, async (req, res) => {
   try {
-    const { groupId, actorId, memberId } = req.body;
+    const { groupId } = req.body;
+    const actorId = requireActor(req, res, req.body.actorId);
+    if (!actorId) return;
+    const memberId = normalizeChatId(req.body.memberId);
     const group = await Group.findOne({ groupId });
     if (!group) return res.status(404).json({ error: "Group not found" });
     if (group.ownerId !== actorId) {
@@ -2096,9 +2323,12 @@ app.post("/groups/demote-admin", async (req, res) => {
   }
 });
 
-app.post("/groups/transfer-ownership", async (req, res) => {
+app.post("/groups/transfer-ownership", requireAuth, groupMutationRateLimiter, async (req, res) => {
   try {
-    const { groupId, actorId, memberId } = req.body;
+    const { groupId } = req.body;
+    const actorId = requireActor(req, res, req.body.actorId);
+    if (!actorId) return;
+    const memberId = normalizeChatId(req.body.memberId);
     const group = await Group.findOne({ groupId });
     if (!group) return res.status(404).json({ error: "Group not found" });
     if (group.ownerId !== actorId) {
@@ -2145,9 +2375,11 @@ app.post("/groups/transfer-ownership", async (req, res) => {
   }
 });
 
-app.post("/groups/exit", async (req, res) => {
+app.post("/groups/exit", requireAuth, groupMutationRateLimiter, async (req, res) => {
   try {
-    const { groupId, chatId } = req.body;
+    const { groupId } = req.body;
+    const chatId = requireSelfChatId(req, res, req.body.chatId);
+    if (!chatId) return;
     const group = await Group.findOne({ groupId });
     if (!group) return res.status(404).json({ error: "Group not found" });
     if (group.ownerId === chatId) {
@@ -2181,9 +2413,11 @@ app.post("/groups/exit", async (req, res) => {
   }
 });
 
-app.post("/groups/delete", async (req, res) => {
+app.post("/groups/delete", requireAuth, groupMutationRateLimiter, async (req, res) => {
   try {
-    const { groupId, actorId } = req.body;
+    const { groupId } = req.body;
+    const actorId = requireActor(req, res, req.body.actorId);
+    if (!actorId) return;
     const group = await Group.findOne({ groupId });
     if (!group) return res.status(404).json({ error: "Group not found" });
     if (group.ownerId !== actorId) {
@@ -2199,6 +2433,7 @@ app.post("/groups/delete", async (req, res) => {
 
 app.get("/check-update", (req, res) => {
   const cfg = readUpdateConfig();
+  res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
   return res.json({
     latest_version: cfg.latest_version,
     apk_url: cfg.apk_url,
@@ -2211,7 +2446,7 @@ app.get("/check-update", (req, res) => {
 });
 
 app.get("/admin/update-panel", (req, res) => {
-  if ((req.query.key || "") !== UPDATE_API_KEY) {
+  if (!isValidUpdateApiKey(req.query.key || "")) {
     return res.status(401).send("Unauthorized");
   }
   const cfg = readUpdateConfig();
@@ -2324,12 +2559,15 @@ app.post(
 );
 
 // ── Legacy stub — E2EE sends payloads, not readable history ─────────────────
-app.get("/messages/:chatId", async (req, res) => {
+app.get("/messages/:chatId", requireAuth, async (req, res) => {
   try {
+    const chatId = requireSelfChatId(req, res, req.params.chatId);
+    if (!chatId) return;
+    const limit = parsePositiveInt(req.query.limit, 200, 500);
     const messages = await Message.find({
-      receiverChatId: req.params.chatId,
+      receiverChatId: chatId,
       status: { $ne: "read" }
-    });
+    }).sort({ timestamp: 1 }).limit(limit).lean();
     res.json(messages);
   } catch (err) {
     res.status(500).json({ error: "Server error" });
@@ -2339,9 +2577,15 @@ app.get("/messages/:chatId", async (req, res) => {
 app.get("/messages/:user1/:user2", (req, res) => res.json([]));
 
 // ── Offline messages for a specific device ───────────────────────────────────
-app.get("/messages/offline/:chatId/:deviceId", async (req, res) => {
+app.get("/messages/offline/:chatId/:deviceId", requireAuth, async (req, res) => {
   try {
-    const { chatId, deviceId } = req.params;
+    const chatId = requireSelfChatId(req, res, req.params.chatId);
+    if (!chatId) return;
+    const deviceId = String(req.params.deviceId || "").trim();
+    if (!deviceId || deviceId !== String(req.auth.deviceId || "")) {
+      return res.status(403).json({ error: "Device mismatch" });
+    }
+    const limit = parsePositiveInt(req.query.limit, 500, 1000);
     const query = {
       $or: [{ receiverChatId: chatId }, { senderChatId: chatId }],
       "payloads.deviceId": { $in: [deviceId, "all"] }
@@ -2350,7 +2594,7 @@ app.get("/messages/offline/:chatId/:deviceId", async (req, res) => {
       query.messageId = String(req.query.messageId);
     }
 
-    const messages = await Message.find(query).sort({ timestamp: 1 });
+    const messages = await Message.find(query).sort({ timestamp: 1 }).limit(limit).lean();
 
     const formatted = messages.map(msg => {
       const payload =
@@ -2387,11 +2631,30 @@ app.get("/messages/offline/:chatId/:deviceId", async (req, res) => {
 });
 
 // ── ACK: delete payload, delete message if none remain ───────────────────────
-app.post("/messages/ack", async (req, res) => {
+app.post("/messages/ack", requireAuth, async (req, res) => {
   try {
-    const { messageId, deviceId } = req.body;
+    const messageId = String(req.body.messageId || "").trim();
+    const deviceId = String(req.body.deviceId || "").trim();
+    if (!messageId || !deviceId) {
+      return res.status(400).json({ error: "messageId and deviceId are required" });
+    }
+    if (deviceId !== String(req.auth.deviceId || "")) {
+      return res.status(403).json({ error: "Device mismatch" });
+    }
     const message = await Message.findOne({ messageId });
     if (!message) return res.status(404).json({ message: "Message not found" });
+    const ownChatId = authChatId(req);
+    const isDirectParticipant =
+      message.senderChatId === ownChatId || message.receiverChatId === ownChatId;
+    let isGroupParticipant = false;
+    if (message.groupId) {
+      isGroupParticipant = Boolean(
+        await Group.exists({ groupId: message.groupId, members: ownChatId }),
+      );
+    }
+    if (!isDirectParticipant && !isGroupParticipant) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
 
     message.payloads = message.payloads.filter(p => p.deviceId !== deviceId);
 
@@ -2408,7 +2671,7 @@ app.post("/messages/ack", async (req, res) => {
 });
 
 // ── Send encrypted message ───────────────────────────────────────────────────
-app.post("/send", async (req, res) => {
+app.post("/send", requireAuth, messageSendRateLimiter, async (req, res) => {
   try {
     const {
       messageId,
@@ -2432,11 +2695,33 @@ app.post("/send", async (req, res) => {
     if (!messageId || !senderChatId || !receiverChatId || !senderDeviceId || !payloads) {
       return res.status(400).json({ error: "Missing required fields" });
     }
+    if (String(messageId).length > 120) {
+      return res.status(400).json({ error: "messageId is too long" });
+    }
+    if (!Array.isArray(payloads) || payloads.length === 0 || payloads.length > 100) {
+      return res.status(400).json({ error: "Invalid encrypted payload list" });
+    }
+    for (const payload of payloads) {
+      if (
+        !payload ||
+        String(payload.deviceId || "").length > 120 ||
+        String(payload.ciphertext || "").length > 512000
+      ) {
+        return res.status(400).json({ error: "Invalid encrypted payload" });
+      }
+    }
 
     const normalizedReceiver = normalizeChatId(receiverChatId);
-    const senderRealId = normalizeChatId(senderChatId);
+    const claimedSenderId = normalizeChatId(senderChatId);
+    const senderRealId = normalizeChatId(req.auth.chatId);
     if (!senderRealId) {
-      return res.status(400).json({ error: "Invalid senderChatId" });
+      return res.status(401).json({ error: "Invalid authenticated sender" });
+    }
+    if (senderDeviceId && String(senderDeviceId) !== String(req.auth.deviceId)) {
+      return res.status(403).json({ error: "Sender device mismatch" });
+    }
+    if (claimedSenderId && !claimedSenderId.startsWith(GHOST_PREFIX) && claimedSenderId !== senderRealId) {
+      return res.status(403).json({ error: "Sender chat ID mismatch" });
     }
 
     let resolvedSenderDevicePublicKey = senderDevicePublicKey
@@ -2509,6 +2794,7 @@ app.post("/send", async (req, res) => {
           return res.status(403).json({ error: "This user does not accept messages" });
         }
         if (recipient.privacy.messages === "contacts" && !isContact) {
+          return res.status(403).json({ error: "This user only accepts messages from contacts" });
         }
       }
 
@@ -2543,6 +2829,9 @@ app.post("/send", async (req, res) => {
         code: "ghost_inactive_sender",
       });
     }
+    if (senderResolution.senderRealId !== senderRealId) {
+      return res.status(403).json({ error: "Sender is not authorized for this identity" });
+    }
     const senderPublicId = senderResolution.senderPublicId;
 
     const ghostResolution = await resolveGhostReceiverId(receiverChatId);
@@ -2556,6 +2845,18 @@ app.post("/send", async (req, res) => {
     const resolvedReceiver = ghostResolution.receiverChatId;
     const ghostSessionId = ghostResolution.ghostSessionId;
 
+    const normalizedGroupId = groupId ? normalizeChatId(groupId) : null;
+    let groupDoc = null;
+    if (normalizedGroupId) {
+      groupDoc = await Group.findOne({ groupId: normalizedGroupId }).select("groupId name members settings admins ownerId");
+      if (!groupDoc || !groupDoc.members.includes(senderRealId) || !groupDoc.members.includes(resolvedReceiver)) {
+        return res.status(403).json({ error: "Not authorized for this group" });
+      }
+      if (groupDoc.settings?.sendMessages === "admins" && groupDoc.ownerId !== senderRealId && !groupDoc.admins.includes(senderRealId)) {
+        return res.status(403).json({ error: "Only admins can send messages in this group" });
+      }
+    }
+
     const message = new Message({
       messageId,
       clientMessageId: clientMessageId || null,
@@ -2564,7 +2865,7 @@ app.post("/send", async (req, res) => {
       senderDeviceId,
       senderDevicePublicKey: resolvedSenderDevicePublicKey,
       payloads,
-      groupId: groupId ? normalizeChatId(groupId) : null,
+      groupId: normalizedGroupId,
       timestamp: timestamp || now,
       replyToId: replyToId || null,
       replyToContent: replyToContent || null,
@@ -2577,13 +2878,14 @@ app.post("/send", async (req, res) => {
     });
 
     const recipient = await User.findOne({ chatId: resolvedReceiver });
-    if (recipient && recipient.blockedUsers.includes(senderRealId)) {
+    if (recipient && !normalizedGroupId && recipient.blockedUsers.includes(senderRealId)) {
       return res.status(403).json({ error: "You are blocked by this user" });
     }
 
-    if (recipient && recipient.privacy.messages !== "everyone") {
+    if (!normalizedGroupId && recipient && recipient.privacy.messages !== "everyone") {
       const isContact = recipient.savedContacts.includes(senderRealId);
       if (recipient.privacy.messages === "contacts" && !isContact) {
+        return res.status(403).json({ error: "This user only accepts messages from contacts" });
       } else if (recipient.privacy.messages === "none") {
         return res.status(403).json({ error: "This user does not accept messages" });
       }
@@ -2592,7 +2894,9 @@ app.post("/send", async (req, res) => {
     await message.save();
 
     io.to(resolvedReceiver).emit("newMessage", message.toObject());
-    io.to(senderRealId).emit("newMessage", message.toObject());
+    if (!normalizedGroupId) {
+      io.to(senderRealId).emit("newMessage", message.toObject());
+    }
 
     if (recipient && recipient.fcmToken) {
       const isOnline = onlineUsers.has(resolvedReceiver) && onlineUsers.get(resolvedReceiver).size > 0;
@@ -2600,12 +2904,12 @@ app.post("/send", async (req, res) => {
         sendDataOnlyPushNotification({
           token: recipient.fcmToken,
           senderId: senderPublicId,
-          senderName: senderPublicId,
+          senderName: normalizedGroupId ? (groupDoc?.name || "Group") : senderPublicId,
           type: typeof type === "number" ? type : 0,
           messageId,
           payloads,
-          groupId: groupId ? normalizeChatId(groupId) : null,
-          isGroup: Boolean(groupId),
+          groupId: normalizedGroupId,
+          isGroup: Boolean(normalizedGroupId),
         });
       }
     }
@@ -2618,7 +2922,7 @@ app.post("/send", async (req, res) => {
 });
 
 // ── Fetch key bundle (for ECDH before sending) ───────────────────────────────
-app.get("/keys/:chatId", async (req, res) => {
+app.get("/keys/:chatId", requireAuth, async (req, res) => {
   try {
     const requestedId = normalizeChatId(req.params.chatId);
     if (requestedId.startsWith(GHOST_PREFIX)) {
@@ -2635,9 +2939,9 @@ app.get("/keys/:chatId", async (req, res) => {
         return res.status(409).json({ message: "This Ghost ID has not been linked yet" });
       }
 
-      const requesterChatId = normalizeChatId(req.query.requesterChatId);
+      const requesterChatId = normalizeChatId(req.auth.chatId);
       if (!requesterChatId) {
-        return res.status(400).json({ message: "requesterChatId is required" });
+        return res.status(401).json({ message: "Authenticated requester is required" });
       }
 
       const lookupChatId =
@@ -2722,9 +3026,9 @@ app.get("/keys/:chatId", async (req, res) => {
 
 // ── Ghost ID (temporary anonymous chat identity) ───────────────────────────
 
-app.post("/ghost/create", async (req, res) => {
+app.post("/ghost/create", requireAuth, async (req, res) => {
   try {
-    const realChatId = normalizeChatId(req.body.realChatId);
+    const realChatId = normalizeChatId(req.auth.chatId);
     if (!realChatId) {
       return res.status(400).json({ error: "realChatId is required" });
     }
@@ -2767,10 +3071,10 @@ app.post("/ghost/create", async (req, res) => {
   }
 });
 
-app.post("/ghost/consume", async (req, res) => {
+app.post("/ghost/consume", requireAuth, async (req, res) => {
   try {
     const ghostId = normalizeChatId(req.body.ghostId);
-    const consumerChatId = normalizeChatId(req.body.consumerChatId);
+    const consumerChatId = normalizeChatId(req.auth.chatId);
     if (!ghostId || !ghostId.startsWith(GHOST_PREFIX)) {
       return res.status(400).json({ error: "Invalid ghost id" });
     }
@@ -2841,7 +3145,7 @@ app.post("/ghost/consume", async (req, res) => {
   }
 });
 
-app.post("/ghost/revoke", async (req, res) => {
+app.post("/ghost/revoke", requireAuth, async (req, res) => {
   try {
     const realChatId = normalizeChatId(req.body.realChatId);
     const ghostIdRaw = (req.body.ghostId || "").toString().trim();
@@ -2911,7 +3215,7 @@ app.get("/ghost/resolve/:ghostId", async (req, res) => {
   }
 });
 
-app.get("/ghost/status/:realChatId", async (req, res) => {
+app.get("/ghost/status/:realChatId", requireAuth, async (req, res) => {
   try {
     const realChatId = normalizeChatId(req.params.realChatId);
     if (!realChatId) {
@@ -2968,7 +3272,6 @@ app.post("/auth/mobile/session", async (req, res) => {
     }
 
     const decoded = await admin.auth().verifyIdToken(String(firebaseIdToken));
-    console.log(decoded);
 
     const firebaseUid = String(decoded.uid || "").trim();
     const phoneNumber = normalizePhoneNumber(decoded.phone_number);
@@ -3154,18 +3457,28 @@ app.post(
   requireDeviceType("mobile"),
   async (req, res) => {
     try {
-      req.device.isActive = false;
-      req.device.tokenVersion += 1;
-      req.device.socketId = null;
-      req.device.lastActive = new Date();
-      await req.device.save();
+      const device = await Device.findOne({
+        userId: req.auth.sub,
+        deviceId: req.auth.deviceId,
+      });
+      const user = await User.findById(req.auth.sub);
+      if (!device || !user) {
+        return res.status(401).json({ error: "Session not found" });
+      }
+      device.isActive = false;
+      device.tokenVersion += 1;
+      device.socketId = null;
+      device.lastActive = new Date();
+      await device.save();
 
-      req.user.activeMobileDeviceId = null;
-      req.user.mobileLastHeartbeatAt = null;
-      await req.user.save();
+      user.activeMobileDeviceId = null;
+      user.mobileLastHeartbeatAt = null;
+      await user.save();
 
-      await revokeAllDesktopDevices(req.user._id);
-      io.to(`user:${req.user.chatId}`).emit("force_logout", {
+      sessionCache.invalidateUser(String(user._id));
+
+      await revokeAllDesktopDevices(user._id);
+      io.to(`user:${user.chatId}`).emit("force_logout", {
         reason: "mobile_logout",
       });
 
@@ -3183,12 +3496,27 @@ app.post(
   requireDeviceType("mobile"),
   async (req, res) => {
     try {
-      req.device.lastActive = new Date();
-      req.device.isActive = true;
-      req.user.activeMobileDeviceId = req.device.deviceId;
-      req.user.mobileLastHeartbeatAt = new Date();
-      await Promise.all([req.device.save(), req.user.save()]);
-      return res.json({ success: true, lastActive: req.device.lastActive });
+      const device = await Device.findOne({
+        userId: req.auth.sub,
+        deviceId: req.auth.deviceId,
+      });
+      const user = await User.findById(req.auth.sub);
+      if (!device || !user) {
+        return res.status(401).json({ error: "Session not found" });
+      }
+      device.lastActive = new Date();
+      device.isActive = true;
+      user.activeMobileDeviceId = device.deviceId;
+      user.mobileLastHeartbeatAt = new Date();
+      await Promise.all([device.save(), user.save()]);
+      sessionCache.set(
+        String(user._id),
+        device.deviceId,
+        Number(device.tokenVersion || 0),
+        user.toObject(),
+        device.toObject(),
+      );
+      return res.json({ success: true, lastActive: device.lastActive });
     } catch (err) {
       console.error(err);
       return res.status(500).json({ error: "Heartbeat failed" });
@@ -3552,7 +3880,7 @@ app.post("/register-device", async (req, res) => {
 });
 
 // ── Update FCM Token ──────────────────────────────────────────────────────────
-app.post("/update-fcm-token", async (req, res) => {
+app.post("/update-fcm-token", requireAuth, async (req, res) => {
   try {
     const { chatId, fcmToken, deviceId } = req.body;
     if (!chatId || !fcmToken) return res.status(400).json({ error: "chatId and fcmToken are required" });
@@ -3579,7 +3907,7 @@ app.post("/update-fcm-token", async (req, res) => {
 });
 
 // ── Sync Saved Contacts (for Mutual Moments) ────────────────────────────────
-app.post("/user/sync-contacts", async (req, res) => {
+app.post("/user/sync-contacts", requireAuth, async (req, res) => {
   try {
     const chatId = normalizeChatId(req.body.chatId);
     const savedContacts = Array.isArray(req.body.savedContacts)
@@ -3630,7 +3958,7 @@ app.get("/user/:chatId/profile", async (req, res) => {
   }
 });
 
-app.post("/user/:chatId/profile", async (req, res) => {
+app.post("/user/:chatId/profile", requireAuth, async (req, res) => {
   try {
     const chatId = normalizeChatId(req.params.chatId);
     const user = await User.findOne({ chatId });
@@ -3703,7 +4031,7 @@ app.post("/user/:chatId/profile", async (req, res) => {
   }
 });
 
-app.post("/user/:chatId/email/verify", async (req, res) => {
+app.post("/user/:chatId/email/verify", requireAuth, async (req, res) => {
   try {
     const chatId = normalizeChatId(req.params.chatId);
     const firebaseIdToken = String(req.body?.firebaseIdToken || "");
@@ -3756,8 +4084,9 @@ app.post("/user/:chatId/email/verify", async (req, res) => {
 });
 
 // ── Get call history ─────────────────────────────────────────────────────────
-app.get("/calls/:chatId", async (req, res) => {
+app.get("/calls/:chatId", requireAuth, async (req, res) => {
   try {
+    setPrivateCache(res, 15);
     const calls = await Call.find({
       $or: [{ caller: req.params.chatId }, { receiver: req.params.chatId }]
     }).sort({ timestamp: -1 }).limit(50);
@@ -3903,7 +4232,7 @@ app.get("/user/:chatId/privacy", async (req, res) => {
   }
 });
 
-app.post("/user/:chatId/privacy", async (req, res) => {
+app.post("/user/:chatId/privacy", requireAuth, async (req, res) => {
   try {
     const { privacy } = req.body;
     const user = await User.findOneAndUpdate(
@@ -3919,7 +4248,7 @@ app.post("/user/:chatId/privacy", async (req, res) => {
 });
 
 // ── Blocking System ─────────────────────────────────────────────────────────
-app.get("/user/:chatId/blocked", async (req, res) => {
+app.get("/user/:chatId/blocked", requireAuth, async (req, res) => {
   try {
     const user = await User.findOne({ chatId: req.params.chatId });
     if (!user) return res.status(404).json({ error: "User not found" });
@@ -3935,7 +4264,7 @@ app.get("/user/:chatId/blocked", async (req, res) => {
   }
 });
 
-app.post("/user/block", async (req, res) => {
+app.post("/user/block", requireAuth, async (req, res) => {
   try {
     const { chatId, targetChatId } = req.body;
     const resolution = await resolveGhostReceiverId(targetChatId);
@@ -3954,7 +4283,7 @@ app.post("/user/block", async (req, res) => {
   }
 });
 
-app.post("/user/unblock", async (req, res) => {
+app.post("/user/unblock", requireAuth, async (req, res) => {
   try {
     const { chatId, targetChatId } = req.body;
     const resolution = await resolveGhostReceiverId(targetChatId);
@@ -3982,7 +4311,18 @@ function ensureRazorpayReady(res) {
   return false;
 }
 
-function validatePaymentConfigAtStartup() {
+function validateRuntimeConfigAtStartup() {
+  const jwtSecret = process.env.AUTH_JWT_SECRET || process.env.JWT_SECRET || "";
+  if (jwtSecret.trim().length < 32) {
+    throw new Error(
+      "Missing or weak JWT secret. Set AUTH_JWT_SECRET with at least 32 characters.",
+    );
+  }
+  if (!UPDATE_API_KEY) {
+    console.warn(
+      "UPDATE_API_KEY is missing. Update admin panel and upload endpoints are disabled until configured.",
+    );
+  }
   if (!razorpayKeyId || !razorpayKeySecret) {
     console.warn(
       "Razorpay configuration is missing. Payment endpoints will return 503 until RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET are set.",
@@ -4030,7 +4370,9 @@ function verifyRazorpaySignature({ orderId, paymentId, signature }) {
   const hmac = crypto.createHmac("sha256", razorpayKeySecret);
   hmac.update(`${orderId}|${paymentId}`);
   const digest = hmac.digest("hex");
-  return digest === signature;
+  const expected = Buffer.from(digest, "hex");
+  const provided = Buffer.from(String(signature || ""), "hex");
+  return expected.length === provided.length && crypto.timingSafeEqual(expected, provided);
 }
 
 async function getPaymentFailureCooldown({ chatId, purpose }) {
@@ -4769,7 +5111,7 @@ app.post("/user/change-chat-id", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/user/change-number", async (req, res) => {
+app.post("/user/change-number", requireAuth, async (req, res) => {
   try {
     const { oldChatId, newChatId } = req.body;
     if (!oldChatId || !newChatId) {
@@ -4816,7 +5158,7 @@ app.post("/user/change-number", async (req, res) => {
   }
 });
 
-app.delete("/user/delete", async (req, res) => {
+app.delete("/user/delete", requireAuth, async (req, res) => {
   try {
     const { chatId } = req.body;
     if (!chatId) return res.status(400).json({ error: "Missing parameters" });
@@ -5246,14 +5588,17 @@ app.post("/moments/report", async (req, res) => {
 });
 
 // ── Upload Media ────────────────────────────────────────────────────────────
-app.post("/upload-media", requireAuth, upload.single("file"), (req, res) => {
+app.post("/upload-media", requireAuth, uploadRateLimiter, upload.single("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
   const fileUrl = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
   res.json({ url: fileUrl });
 });
 
+registerGlobalErrorHandlers(app);
+
 // ── Socket.IO ────────────────────────────────────────────────────────────────
+io.use(createSocketPacketLimiter(Number(process.env.SOCKET_EVENTS_PER_SEC || 50)));
 io.use(async (socket, next) => {
   try {
     const token =
@@ -5263,18 +5608,22 @@ io.use(async (socket, next) => {
     const sessionId = String(socket.handshake.auth?.sessionId || "");
 
     if (token) {
-      let payload;
-      try {
-        payload = verifyAccessToken(token);
-      } catch (error) {
-        if (!isTokenExpiredError(error)) {
-          throw error;
-        }
-        payload = verifyAccessTokenAllowExpired(token);
+      const payload = verifyAccessToken(token);
+      const userId = String(payload?.sub || "").trim();
+      const deviceId = String(payload?.deviceId || "").trim();
+      const tokenVersion = Number(payload?.tokenVersion || 0);
+      let device;
+      const cached = sessionCache.get(userId, deviceId, tokenVersion);
+      device = cached?.device;
+      if (!device) {
+        device = await Device.findOne({ userId, deviceId }).lean();
       }
-      const device = await Device.findOne({ deviceId: payload.deviceId });
-      if (!device || !device.isActive || Number(device.tokenVersion || 0) !== Number(payload.tokenVersion || 0)) {
+      if (!device || !device.isActive || Number(device.tokenVersion || 0) !== tokenVersion) {
         return next(new Error("Unauthorized"));
+      }
+      if (!cached?.device && device) {
+        const user = await User.findById(userId).lean();
+        if (user) sessionCache.set(userId, deviceId, tokenVersion, user, device);
       }
       socket.data.auth = payload;
       socket.data.deviceId = payload.deviceId;
@@ -5356,7 +5705,11 @@ io.on("connection", (socket) => {
     data.from = socket.data.auth.chatId;
     const to = await resolveGhostReceiverId(data.to);
     const room = to.ghostInvalid ? data.to : to.receiverChatId;
-    io.to(room).emit("message_delivered", data);
+    Message.updateOne(
+      { messageId: data.messageId, status: "sent" },
+      { $set: { status: "delivered" } }
+    ).catch(() => {});
+    io.to(room).to(`user:${room}`).emit("message_delivered", data);
   });
 
   socket.on("message_read", async (data) => {
@@ -5365,7 +5718,20 @@ io.on("connection", (socket) => {
     data.from = socket.data.auth.chatId;
     const to = await resolveGhostReceiverId(data.to);
     const room = to.ghostInvalid ? data.to : to.receiverChatId;
-    io.to(room).emit("message_read", data);
+
+    try {
+      const reader = await User.findOne({ chatId: data.from }).select("privacy").lean();
+      const targetUser = await User.findOne({ chatId: to.receiverChatId }).select("privacy").lean();
+      if (reader?.privacy?.readReceipts === false || targetUser?.privacy?.readReceipts === false) {
+        return; // Reciprocal privacy: hide read receipt
+      }
+    } catch (_) {}
+
+    Message.updateOne(
+      { messageId: data.messageId },
+      { $set: { status: "read" } }
+    ).catch(() => {});
+    io.to(room).to(`user:${room}`).emit("message_read", data);
   });
 
   socket.on("send_group_message", async (data) => {
@@ -6299,14 +6665,33 @@ async function purgeInactiveMobileSessions() {
 const PORT = process.env.PORT || 3000;
 
 async function bootstrapServer() {
-  validatePaymentConfigAtStartup();
+  validateRuntimeConfigAtStartup();
   initializeFirebaseAdmin();
   ensureUpdateConfig();
   await connectMongo();
+  if (redisUrl) {
+    socketRedisClients = await setupSocketRedisAdapter(io, redisUrl).catch((e) => {
+      console.warn("Socket Redis adapter failed:", e.message);
+      return null;
+    });
+  }
 
   server.listen(PORT, "0.0.0.0", () => {
-    console.log(`Convoo E2EE Server running on port ${PORT}`);
+    console.log(`Convoo E2EE Server running on port ${PORT} (pid ${process.pid})`);
   });
+
+  const shutdownHooks = registerGracefulShutdown(
+    server,
+    async () => {
+      sessionCache.clear();
+      await mongoose.disconnect();
+      if (redisClient?.isOpen) await redisClient.quit().catch(() => {});
+      if (socketRedisClients?.pub?.isOpen) await socketRedisClients.pub.quit().catch(() => {});
+      if (socketRedisClients?.sub?.isOpen) await socketRedisClients.sub.quit().catch(() => {});
+    },
+    io,
+  );
+  healthState.isShuttingDown = shutdownHooks.isShuttingDown;
 
   setInterval(() => {
     purgeExpiredGhostSessions().catch((e) =>

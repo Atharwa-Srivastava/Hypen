@@ -1,8 +1,8 @@
 {
-  "latest_version": "3.0.7",
-  "apk_url": "https://firebasestorage.googleapis.com/v0/b/convoo-a9135.firebasestorage.app/o/convoo-latest.apk?alt=media",
+  "latest_version": "3.0.2",
+  "apk_url": "https://firebasestorage.googleapis.com/v0/b/convoo-a9135.firebasestorage.app/o/Convoo3.0.6.apk?alt=media",
   "force_update": false,
-  "required": true,
+  "required": false,
   "play_store_enabled": false,
   "play_store_url": "",
   "changelog": "Initial release."

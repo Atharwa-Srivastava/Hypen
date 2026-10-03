@@ -1,5 +1,6 @@
 const User = require("../models/User");
 const Device = require("../models/Device");
+const sessionCache = require("../services/session-cache");
 const {
   verifyAccessToken,
   isTokenExpiredError,
@@ -40,10 +41,31 @@ async function requireAuth(req, res, next) {
       return res.status(401).json({ error: "Invalid auth token" });
     }
 
-    const [user, device] = await Promise.all([
-      User.findById(userId),
-      Device.findOne({ userId, deviceId }),
-    ]);
+    let user;
+    let device;
+    const cached = sessionCache.get(userId, deviceId, tokenVersion);
+    if (cached) {
+      user = cached.user;
+      device = cached.device;
+    }
+    if (!user || !device) {
+      const lookups = [];
+      if (!user) {
+        lookups.push(
+          User.findById(userId).lean().then((doc) => {
+            user = doc;
+          }),
+        );
+      }
+      if (!device) {
+        lookups.push(
+          Device.findOne({ userId, deviceId }).lean().then((doc) => {
+            device = doc;
+          }),
+        );
+      }
+      await Promise.all(lookups);
+    }
 
     if (!user || !device) {
       return res.status(401).json({ error: "Session not found" });
@@ -61,6 +83,9 @@ async function requireAuth(req, res, next) {
       return res.status(401).json({ error: "Session has been revoked" });
     }
 
+    if (!cached || !cached.user || !cached.device) {
+      sessionCache.set(userId, deviceId, tokenVersion, user, device);
+    }
     req.auth = payload;
     req.user = user;
     req.device = device;

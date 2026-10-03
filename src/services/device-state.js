@@ -1,4 +1,5 @@
 const Device = require("../models/Device");
+const sessionCache = require("./session-cache");
 
 const MOBILE_INACTIVE_MS = 5 * 60 * 1000;
 const MAX_LINKED_DEVICES = 4;
@@ -43,6 +44,7 @@ async function revokeDevice(deviceId) {
   device.socketId = null;
   device.lastActive = new Date();
   await device.save();
+  sessionCache.invalidateDevice(String(device.userId), device.deviceId);
   return device;
 }
 
