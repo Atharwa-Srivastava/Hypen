@@ -1244,11 +1244,17 @@ async function attachAuthenticatedSocket(socket) {
   if (socket.data.authAttached) {
     return;
   }
+  const cleanChatId = normalizeChatId(auth.chatId);
   socket.data.authAttached = true;
-  socket.data.chatId = auth.chatId;
+  socket.data.chatId = cleanChatId || auth.chatId;
   socket.data.deviceId = auth.deviceId;
   socket.join(auth.chatId);
   socket.join(`user:${auth.chatId}`);
+  if (cleanChatId && cleanChatId !== auth.chatId) {
+    socket.join(cleanChatId);
+    socket.join(`user:${cleanChatId}`);
+    addOnlineSocket(cleanChatId, socket.id);
+  }
   socket.join(`device:${auth.deviceId}`);
   addOnlineSocket(auth.chatId, socket.id);
   const presencePayload = {
@@ -2666,6 +2672,28 @@ app.post("/messages/ack", requireAuth, async (req, res) => {
 
     message.payloads = message.payloads.filter(p => p.deviceId !== deviceId);
 
+    // Notify sender immediately that the message was delivered to recipient
+    if (message.senderChatId) {
+      const deliveryPayload = {
+        messageId: message.messageId,
+        clientMessageId: message.clientMessageId || message.messageId,
+        to: message.senderChatId,
+        from: ownChatId,
+        type: "message_delivered",
+      };
+      const cleanSender = normalizeChatId(message.senderChatId);
+      const roomsToEmit = new Set([cleanSender, message.senderChatId, `user:${cleanSender}`, `user:${message.senderChatId}`]);
+      for (const r of roomsToEmit) {
+        if (r) io.to(r).emit("message_delivered", deliveryPayload);
+      }
+      const senderSockets = onlineUsers.get(cleanSender) || onlineUsers.get(message.senderChatId);
+      if (senderSockets) {
+        for (const sId of senderSockets) {
+          io.to(sId).emit("message_delivered", deliveryPayload);
+        }
+      }
+    }
+
     if (message.payloads.length === 0) {
       await Message.deleteOne({ messageId });
       return res.json({ message: "Message fully deleted ✅" });
@@ -2806,10 +2834,19 @@ app.post("/send", requireAuth, messageSendRateLimiter, async (req, res) => {
         }
       }
 
-      await message.save();
+      const messagePayload = message.toObject();
+      io.to(resolvedReceiver).emit("newMessage", messagePayload);
+      io.to(`user:${resolvedReceiver}`).emit("newMessage", messagePayload);
+      const receiverSockets = onlineUsers.get(resolvedReceiver);
+      if (receiverSockets) {
+        for (const sId of receiverSockets) {
+          io.to(sId).emit("newMessage", messagePayload);
+        }
+      }
+      io.to(senderRealId).emit("newMessage", messagePayload);
+      io.to(`user:${senderRealId}`).emit("newMessage", messagePayload);
 
-      io.to(resolvedReceiver).emit("newMessage", message.toObject());
-      io.to(senderRealId).emit("newMessage", message.toObject());
+      await message.save();
 
       if (recipient && recipient.fcmToken) {
         const isOnline = onlineUsers.has(resolvedReceiver) && onlineUsers.get(resolvedReceiver).size > 0;
@@ -2899,12 +2936,21 @@ app.post("/send", requireAuth, messageSendRateLimiter, async (req, res) => {
       }
     }
 
-    await message.save();
-
-    io.to(resolvedReceiver).emit("newMessage", message.toObject());
-    if (!normalizedGroupId) {
-      io.to(senderRealId).emit("newMessage", message.toObject());
+    const messagePayload = message.toObject();
+    io.to(resolvedReceiver).emit("newMessage", messagePayload);
+    io.to(`user:${resolvedReceiver}`).emit("newMessage", messagePayload);
+    const receiverSockets = onlineUsers.get(resolvedReceiver);
+    if (receiverSockets) {
+      for (const sId of receiverSockets) {
+        io.to(sId).emit("newMessage", messagePayload);
+      }
     }
+    if (!normalizedGroupId) {
+      io.to(senderRealId).emit("newMessage", messagePayload);
+      io.to(`user:${senderRealId}`).emit("newMessage", messagePayload);
+    }
+
+    await message.save();
 
     if (recipient && recipient.fcmToken) {
       const isOnline = onlineUsers.has(resolvedReceiver) && onlineUsers.get(resolvedReceiver).size > 0;
@@ -5710,36 +5756,62 @@ io.on("connection", (socket) => {
   socket.on("message_delivered", async (data) => {
     if (!socket.data.auth?.chatId) return;
     if (!data?.messageId || !data?.to) return;
-    data.from = socket.data.auth.chatId;
+    data.from = normalizeChatId(socket.data.auth.chatId);
+    data.type = "message_delivered";
     const to = await resolveGhostReceiverId(data.to);
     const room = to.ghostInvalid ? data.to : to.receiverChatId;
+    const cleanRoom = normalizeChatId(room);
+
     Message.updateOne(
-      { messageId: data.messageId, status: "sent" },
+      { $or: [{ messageId: data.messageId }, { clientMessageId: data.messageId }], status: { $ne: "read" } },
       { $set: { status: "delivered" } }
     ).catch(() => {});
-    io.to(room).to(`user:${room}`).emit("message_delivered", data);
+
+    const roomsToEmit = new Set([cleanRoom, room, `user:${cleanRoom}`, `user:${room}`]);
+    for (const r of roomsToEmit) {
+      if (r) io.to(r).emit("message_delivered", data);
+    }
+    const userSockets = onlineUsers.get(cleanRoom) || onlineUsers.get(room);
+    if (userSockets) {
+      for (const sId of userSockets) {
+        io.to(sId).emit("message_delivered", data);
+      }
+    }
   });
 
   socket.on("message_read", async (data) => {
     if (!socket.data.auth?.chatId) return;
     if (!data?.messageId || !data?.to) return;
-    data.from = socket.data.auth.chatId;
+    data.from = normalizeChatId(socket.data.auth.chatId);
+    data.type = "message_read";
     const to = await resolveGhostReceiverId(data.to);
     const room = to.ghostInvalid ? data.to : to.receiverChatId;
+    const cleanRoom = normalizeChatId(room);
+    const cleanFrom = normalizeChatId(data.from);
 
     try {
-      const reader = await User.findOne({ chatId: data.from }).select("privacy").lean();
-      const targetUser = await User.findOne({ chatId: to.receiverChatId }).select("privacy").lean();
+      const reader = await User.findOne({ chatId: { $in: [cleanFrom, data.from] } }).select("privacy").lean();
+      const targetUser = await User.findOne({ chatId: { $in: [cleanRoom, to.receiverChatId] } }).select("privacy").lean();
       if (reader?.privacy?.readReceipts === false || targetUser?.privacy?.readReceipts === false) {
         return; // Reciprocal privacy: hide read receipt
       }
     } catch (_) {}
 
     Message.updateOne(
-      { messageId: data.messageId },
+      { $or: [{ messageId: data.messageId }, { clientMessageId: data.messageId }] },
       { $set: { status: "read" } }
     ).catch(() => {});
-    io.to(room).to(`user:${room}`).emit("message_read", data);
+
+    const roomsToEmit = new Set([cleanRoom, room, `user:${cleanRoom}`, `user:${room}`]);
+    for (const r of roomsToEmit) {
+      if (r) io.to(r).emit("message_read", data);
+    }
+    const userSockets = onlineUsers.get(cleanRoom) || onlineUsers.get(room);
+    if (userSockets) {
+      for (const sId of userSockets) {
+        io.to(sId).emit("message_read", data);
+      }
+    }
   });
 
   socket.on("send_group_message", async (data) => {
