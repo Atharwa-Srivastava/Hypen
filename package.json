@@ -8,7 +8,7 @@
     "start": "node src/server.js",
     "start:cluster": "node src/cluster.js",
     "start:single": "node src/server.js",
-    "test": "echo \"Tests passed\""
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=20"
@@ -34,5 +34,8 @@
     "redis": "^5.12.1",
     "socket.io": "^4.8.3",
     "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.4"
   }
 }

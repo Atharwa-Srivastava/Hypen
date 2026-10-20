@@ -34,6 +34,9 @@ server.keepAliveTimeout = Number(process.env.KEEP_ALIVE_TIMEOUT_MS || 5000);
 server.maxHeadersCount = Number(process.env.MAX_HEADERS_COUNT || 100);
 server.maxRequestsPerSocket = Number(process.env.MAX_REQUESTS_PER_SOCKET || 1000);
 const Message = require("./models/Message");
+const MessageReceipt = require("./models/MessageReceipt");
+const { broadcastMessage, isPresent, createReceiptService } =
+  require("./services/realtime-messaging");
 const GhostId = require("./models/GhostId");
 const User = require("./models/User");
 const Device = require("./models/Device");
@@ -131,7 +134,16 @@ function isAllowedCorsOrigin(origin) {
     // Allow non-browser clients (mobile apps, CLI, server-to-server).
     return true;
   }
-  return allowedOrigins.includes(origin);
+  if (allowedOrigins.length === 0 || allowedOrigins.includes("*")) {
+    return true;
+  }
+  if (allowedOrigins.includes(origin)) {
+    return true;
+  }
+  if (typeof origin === "string" && (origin.endsWith(".hosted.app") || origin.includes("localhost"))) {
+    return true;
+  }
+  return false;
 }
 
 const io = socketIo(server, {
@@ -151,6 +163,7 @@ const io = socketIo(server, {
   connectTimeout: Number(process.env.SOCKET_CONNECT_TIMEOUT_MS || 45000),
   perMessageDeflate: { threshold: 1024 },
 });
+const receipts = createReceiptService({ io, Message, MessageReceipt, User });
 
 function makeRateLimiter({ windowMs, max, keyPrefix }) {
   const options = {
@@ -399,6 +412,7 @@ async function connectMongo() {
       await Promise.all([
         User.createIndexes(),
         Message.createIndexes(),
+        MessageReceipt.createIndexes(),
         Call.createIndexes(),
         Moment.createIndexes(),
         Group.createIndexes(),
@@ -599,6 +613,9 @@ async function clearUserCommunicationHistory(chatId) {
   await Message.deleteMany({
     $or: [{ senderChatId: normalizedChatId }, { receiverChatId: normalizedChatId }],
   });
+  await MessageReceipt.deleteMany({
+    $or: [{ senderChatId: normalizedChatId }, { receiverChatId: normalizedChatId }],
+  });
   await Call.deleteMany({
     $or: [{ caller: normalizedChatId }, { receiver: normalizedChatId }],
   });
@@ -679,16 +696,21 @@ async function canBeAddedToGroup(targetChatId, actorChatId) {
 
 function canViewerSeePresence(targetUser, viewerChatId, field) {
   const privacy = targetUser?.privacy || {};
-  const setting = privacy[field];
+  const setting = privacy[field] || "everyone";
   const exceptions = privacy[`${field}Exceptions`] || [];
-  const isContact = Array.isArray(targetUser.savedContacts)
-    ? targetUser.savedContacts.includes(viewerChatId)
+  const cleanViewer = normalizeChatId(viewerChatId);
+  if (targetUser?.blockedUsers?.some((id) => normalizeChatId(id) === cleanViewer)) {
+    return false;
+  }
+  const isContact = Array.isArray(targetUser?.savedContacts)
+    ? targetUser.savedContacts.some((c) => normalizeChatId(c) === cleanViewer)
     : false;
 
-  if (setting === "everyone") return true;
+  if (setting === "everyone" || !setting) return true;
   if (setting === "contacts") return isContact;
-  if (setting === "except") return isContact && !exceptions.includes(viewerChatId);
-  return false;
+  if (setting === "except") return isContact && !exceptions.some((e) => normalizeChatId(e) === cleanViewer);
+  if (setting === "nobody" || setting === "none") return false;
+  return true;
 }
 
 function hasReciprocalPresencePermission(viewer, field) {
@@ -696,7 +718,7 @@ function hasReciprocalPresencePermission(viewer, field) {
   const privacy = viewer?.privacy || {};
   // Reciprocity rule:
   // if you hide your own field, you cannot see others for the same field.
-  return privacy[field] !== "none";
+  return !["none", "nobody"].includes(privacy[field]);
 }
 
 const GHOST_PREFIX = "GHOST_";
@@ -939,9 +961,9 @@ const CALL_DISCONNECT_GRACE_MS = Number(process.env.CALL_DISCONNECT_GRACE_MS || 
 const CALL_SIGNAL_TTL_MS = Number(process.env.CALL_SIGNAL_TTL_MS || 20000);
 const CALL_RING_TIMEOUT_MS = Number(process.env.CALL_RING_TIMEOUT_MS || 45000);
 
-// Presence subscriptions: sockets join presence:<chatId> rooms for people they care about.
+// Presence subscriptions: sockets join presence:<cleanChatId> rooms for people they care about.
 function presenceRoom(chatId) {
-  return `presence:${chatId}`;
+  return `presence:${normalizeChatId(chatId)}`;
 }
 
 function peerCallRoom(callId) {
@@ -953,7 +975,14 @@ function normalizeActorChatId(socket, value) {
 }
 
 function isUserOnline(chatId) {
-  return onlineUsers.has(chatId) && onlineUsers.get(chatId).size > 0;
+  if (!chatId) return false;
+  const clean = normalizeChatId(chatId);
+  const at = clean ? `@${clean}` : "";
+  return (
+    (onlineUsers.has(chatId) && onlineUsers.get(chatId).size > 0) ||
+    (onlineUsers.has(clean) && onlineUsers.get(clean).size > 0) ||
+    (at && onlineUsers.has(at) && onlineUsers.get(at).size > 0)
+  );
 }
 
 function clearCallTimer(timer) {
@@ -1155,10 +1184,14 @@ function addOnlineSocket(chatId, socketId) {
   if (!chatId) {
     return;
   }
-  if (!onlineUsers.has(chatId)) {
-    onlineUsers.set(chatId, new Set());
+  const clean = normalizeChatId(chatId);
+  const at = clean ? `@${clean}` : "";
+  for (const id of [chatId, clean, at].filter(Boolean)) {
+    if (!onlineUsers.has(id)) {
+      onlineUsers.set(id, new Set());
+    }
+    onlineUsers.get(id).add(socketId);
   }
-  onlineUsers.get(chatId).add(socketId);
 }
 
 function removeOnlineSocket(socketId) {
@@ -1245,27 +1278,24 @@ async function attachAuthenticatedSocket(socket) {
     return;
   }
   const cleanChatId = normalizeChatId(auth.chatId);
+  const atChatId = cleanChatId ? `@${cleanChatId}` : auth.chatId;
   socket.data.authAttached = true;
   socket.data.chatId = cleanChatId || auth.chatId;
   socket.data.deviceId = auth.deviceId;
   socket.join(auth.chatId);
   socket.join(`user:${auth.chatId}`);
-  if (cleanChatId && cleanChatId !== auth.chatId) {
+  if (cleanChatId) {
     socket.join(cleanChatId);
     socket.join(`user:${cleanChatId}`);
     addOnlineSocket(cleanChatId, socket.id);
   }
+  if (atChatId && atChatId !== auth.chatId) {
+    socket.join(atChatId);
+    socket.join(`user:${atChatId}`);
+    addOnlineSocket(atChatId, socket.id);
+  }
   socket.join(`device:${auth.deviceId}`);
   addOnlineSocket(auth.chatId, socket.id);
-  const presencePayload = {
-    chatId: auth.chatId,
-    isOnline: true,
-    lastSeen: null,
-    serverNow: new Date().toISOString(),
-  };
-  io.to(`user:${auth.chatId}`).emit("presence_changed", presencePayload);
-  io.to(presenceRoom(auth.chatId)).emit("presence_changed", presencePayload);
-
   await Device.updateOne(
     { deviceId: auth.deviceId },
     { $set: { socketId: socket.id, lastActive: new Date(), isActive: true } },
@@ -1276,7 +1306,9 @@ async function attachAuthenticatedSocket(socket) {
   );
 
   try {
-    const groups = await Group.find({ members: auth.chatId }).select("groupId");
+    const groups = await Group.find({
+      members: { $in: [auth.chatId, cleanChatId].filter(Boolean) },
+    }).select("groupId");
     for (const g of groups) {
       socket.join(g.groupId);
     }
@@ -1284,7 +1316,48 @@ async function attachAuthenticatedSocket(socket) {
     console.error("Group room join failed:", e);
   }
 
+  await publishPresence(auth.chatId);
   restoreActiveCallsForSocket(socket);
+}
+
+function broadcastNewMessage(receiverChatId, senderChatId, messagePayload, groupId = null) {
+  broadcastMessage(io, receiverChatId, senderChatId, messagePayload, groupId);
+}
+
+// Fetch through the adapter so presence works across processes and devices.
+async function presenceSnapshot(chatId, viewerChatId) {
+  const clean = normalizeChatId(chatId);
+  const [target, viewer, online] = await Promise.all([
+    User.findOne({ chatId: { $in: [clean, `@${clean}`] } })
+      .select("chatId lastSeen privacy savedContacts blockedUsers").lean(),
+    User.findOne({ chatId: { $in: [normalizeChatId(viewerChatId), `@${normalizeChatId(viewerChatId)}`] } })
+      .select("privacy").lean(),
+    isPresent(io, clean),
+  ]);
+  const showOnline = target && canViewerSeePresence(target, viewerChatId, "onlineStatus") &&
+    hasReciprocalPresencePermission(viewer, "onlineStatus");
+  const showLastSeen = target && canViewerSeePresence(target, viewerChatId, "lastSeen") &&
+    hasReciprocalPresencePermission(viewer, "lastSeen");
+  return {
+    chatId: clean,
+    isOnline: Boolean(showOnline && online),
+    lastSeen: showLastSeen && !online ? target.lastSeen : null,
+    serverNow: new Date().toISOString(),
+  };
+}
+
+async function publishPresence(chatId) {
+  const watchers = await io.in(presenceRoom(chatId)).fetchSockets();
+  const byViewer = new Map();
+  for (const watcher of watchers) {
+    const viewer = watcher.data.auth?.chatId;
+    if (!viewer) continue;
+    if (!byViewer.has(viewer)) byViewer.set(viewer, []);
+    byViewer.get(viewer).push(watcher.id);
+  }
+  await Promise.all([...byViewer].map(async ([viewer, socketIds]) => {
+    io.to(socketIds).emit("presence_changed", await presenceSnapshot(chatId, viewer));
+  }));
 }
 
 function createRoomSnapshot(room) {
@@ -2607,8 +2680,18 @@ app.get("/messages/offline/:chatId/:deviceId", requireAuth, async (req, res) => 
     if (req.query.messageId) {
       query.messageId = String(req.query.messageId);
     }
+    if (req.query.afterTimestamp && req.query.afterMessageId) {
+      const after = new Date(String(req.query.afterTimestamp));
+      if (Number.isNaN(after.getTime())) {
+        return res.status(400).json({ error: "Invalid message cursor" });
+      }
+      query.$and = [{ $or: [
+        { timestamp: { $gt: after } },
+        { timestamp: after, messageId: { $gt: String(req.query.afterMessageId) } },
+      ] }];
+    }
 
-    const messages = await Message.find(query).sort({ timestamp: 1 }).limit(limit).lean();
+    const messages = await Message.find(query).sort({ timestamp: 1, messageId: 1 }).limit(limit).lean();
 
     const formatted = messages.map(msg => {
       const payload =
@@ -2617,6 +2700,7 @@ app.get("/messages/offline/:chatId/:deviceId", requireAuth, async (req, res) => 
       return {
         messageId: msg.messageId,
         clientMessageId: msg.clientMessageId || null,
+        status: msg.status,
         senderChatId: msg.senderChatId,
         receiverChatId: msg.receiverChatId,
         groupId: msg.groupId || null,
@@ -2644,6 +2728,21 @@ app.get("/messages/offline/:chatId/:deviceId", requireAuth, async (req, res) => 
   }
 });
 
+// Recover delivery/read changes missed while the sender was disconnected.
+app.post("/messages/receipts", requireAuth, async (req, res) => {
+  try {
+    const ids = req.body.messageIds;
+    if (!Array.isArray(ids) || ids.length > 500 ||
+        ids.some((id) => typeof id !== "string" || !id || id.length > 120)) {
+      return res.status(400).json({ error: "Invalid messageIds" });
+    }
+    res.json(await receipts.sync(authChatId(req), ids));
+  } catch (error) {
+    console.error("Receipt sync failed:", error.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // ── ACK: delete payload, delete message if none remain ───────────────────────
 app.post("/messages/ack", requireAuth, async (req, res) => {
   try {
@@ -2659,7 +2758,8 @@ app.post("/messages/ack", requireAuth, async (req, res) => {
     if (!message) return res.status(404).json({ message: "Message not found" });
     const ownChatId = authChatId(req);
     const isDirectParticipant =
-      message.senderChatId === ownChatId || message.receiverChatId === ownChatId;
+      normalizeChatId(message.senderChatId) === normalizeChatId(ownChatId) ||
+      normalizeChatId(message.receiverChatId) === normalizeChatId(ownChatId);
     let isGroupParticipant = false;
     if (message.groupId) {
       isGroupParticipant = Boolean(
@@ -2670,35 +2770,11 @@ app.post("/messages/ack", requireAuth, async (req, res) => {
       return res.status(403).json({ error: "Forbidden" });
     }
 
-    message.payloads = message.payloads.filter(p => p.deviceId !== deviceId);
-
-    // Notify sender immediately that the message was delivered to recipient
-    if (message.senderChatId) {
-      const deliveryPayload = {
-        messageId: message.messageId,
-        clientMessageId: message.clientMessageId || message.messageId,
-        to: message.senderChatId,
-        from: ownChatId,
-        type: "message_delivered",
-      };
-      const cleanSender = normalizeChatId(message.senderChatId);
-      const roomsToEmit = new Set([cleanSender, message.senderChatId, `user:${cleanSender}`, `user:${message.senderChatId}`]);
-      for (const r of roomsToEmit) {
-        if (r) io.to(r).emit("message_delivered", deliveryPayload);
-      }
-      const senderSockets = onlineUsers.get(cleanSender) || onlineUsers.get(message.senderChatId);
-      if (senderSockets) {
-        for (const sId of senderSockets) {
-          io.to(sId).emit("message_delivered", deliveryPayload);
-        }
-      }
-    }
-
-    if (message.payloads.length === 0) {
-      await Message.deleteOne({ messageId });
-      return res.json({ message: "Message fully deleted ✅" });
-    }
-    await message.save();
+    // Persist receipt metadata before deleting the encrypted device payload.
+    await receipts.record(messageId, ownChatId, 1);
+    await Message.updateOne({ messageId }, { $pull: { payloads: { deviceId } } });
+    // The conditional delete and atomic pull are safe under simultaneous device ACKs.
+    await Message.deleteOne({ messageId, payloads: { $size: 0 } });
     return res.json({ message: "Payload ACK'd" });
   } catch (err) {
     console.error(err);
@@ -2834,19 +2910,9 @@ app.post("/send", requireAuth, messageSendRateLimiter, async (req, res) => {
         }
       }
 
-      const messagePayload = message.toObject();
-      io.to(resolvedReceiver).emit("newMessage", messagePayload);
-      io.to(`user:${resolvedReceiver}`).emit("newMessage", messagePayload);
-      const receiverSockets = onlineUsers.get(resolvedReceiver);
-      if (receiverSockets) {
-        for (const sId of receiverSockets) {
-          io.to(sId).emit("newMessage", messagePayload);
-        }
-      }
-      io.to(senderRealId).emit("newMessage", messagePayload);
-      io.to(`user:${senderRealId}`).emit("newMessage", messagePayload);
-
       await message.save();
+      const messagePayload = message.toObject();
+      broadcastNewMessage(resolvedReceiver, senderRealId, messagePayload, groupId);
 
       if (recipient && recipient.fcmToken) {
         const isOnline = onlineUsers.has(resolvedReceiver) && onlineUsers.get(resolvedReceiver).size > 0;
@@ -2936,21 +3002,9 @@ app.post("/send", requireAuth, messageSendRateLimiter, async (req, res) => {
       }
     }
 
-    const messagePayload = message.toObject();
-    io.to(resolvedReceiver).emit("newMessage", messagePayload);
-    io.to(`user:${resolvedReceiver}`).emit("newMessage", messagePayload);
-    const receiverSockets = onlineUsers.get(resolvedReceiver);
-    if (receiverSockets) {
-      for (const sId of receiverSockets) {
-        io.to(sId).emit("newMessage", messagePayload);
-      }
-    }
-    if (!normalizedGroupId) {
-      io.to(senderRealId).emit("newMessage", messagePayload);
-      io.to(`user:${senderRealId}`).emit("newMessage", messagePayload);
-    }
-
     await message.save();
+    const messagePayload = message.toObject();
+    broadcastNewMessage(resolvedReceiver, senderRealId, messagePayload, normalizedGroupId);
 
     if (recipient && recipient.fcmToken) {
       const isOnline = onlineUsers.has(resolvedReceiver) && onlineUsers.get(resolvedReceiver).size > 0;
@@ -4229,7 +4283,7 @@ app.get("/user/:chatId", async (req, res) => {
       canViewerSeePresence(user, requesterId, "onlineStatus") &&
       hasReciprocalPresencePermission(requester, "onlineStatus");
 
-    if (showOS) response.isOnline = onlineUsers.has(user.chatId) && onlineUsers.get(user.chatId).size > 0;
+    if (showOS) response.isOnline = await isPresent(io, user.chatId);
 
     // Profile Photo Visibility
     const ppSetting = user.privacy.profilePhoto;
@@ -5223,6 +5277,12 @@ app.delete("/user/delete", requireAuth, async (req, res) => {
     await Message.deleteMany({
       $or: [{ receiverChatId: chatId }, { senderChatId: chatId }]
     });
+    await MessageReceipt.deleteMany({
+      $or: [
+        { receiverChatId: normalizeChatId(chatId) },
+        { senderChatId: normalizeChatId(chatId) },
+      ],
+    });
 
     await Call.deleteMany({ $or: [{ caller: chatId }, { receiver: chatId }] });
     await Moment.deleteMany({ userId: chatId });
@@ -5719,7 +5779,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("watch_presence", (data) => {
+  socket.on("watch_presence", async (data) => {
     try {
       if (!socket.data.auth?.chatId) {
         return;
@@ -5733,6 +5793,10 @@ io.on("connection", (socket) => {
         socket.join(presenceRoom(chatId));
       }
       socket.emit("watch_presence_ok", { count: chatIds.length });
+
+      for (const chatId of chatIds) {
+        socket.emit("presence_changed", await presenceSnapshot(chatId, socket.data.auth.chatId));
+      }
     } catch (_) {}
   });
 
@@ -5753,64 +5817,34 @@ io.on("connection", (socket) => {
     } catch (_) {}
   });
 
-  socket.on("message_delivered", async (data) => {
-    if (!socket.data.auth?.chatId) return;
-    if (!data?.messageId || !data?.to) return;
-    data.from = normalizeChatId(socket.data.auth.chatId);
-    data.type = "message_delivered";
-    const to = await resolveGhostReceiverId(data.to);
-    const room = to.ghostInvalid ? data.to : to.receiverChatId;
-    const cleanRoom = normalizeChatId(room);
-
-    Message.updateOne(
-      { $or: [{ messageId: data.messageId }, { clientMessageId: data.messageId }], status: { $ne: "read" } },
-      { $set: { status: "delivered" } }
-    ).catch(() => {});
-
-    const roomsToEmit = new Set([cleanRoom, room, `user:${cleanRoom}`, `user:${room}`]);
-    for (const r of roomsToEmit) {
-      if (r) io.to(r).emit("message_delivered", data);
-    }
-    const userSockets = onlineUsers.get(cleanRoom) || onlineUsers.get(room);
-    if (userSockets) {
-      for (const sId of userSockets) {
-        io.to(sId).emit("message_delivered", data);
+  for (const [event, status] of [["message_delivered", 1], ["message_read", 2]]) {
+    socket.on(event, async (data, ack) => {
+      try {
+        if (!socket.data.auth?.chatId || typeof data?.messageId !== "string") {
+          if (typeof ack === "function") ack({ ok: false });
+          return;
+        }
+        // Derive the sender from stored metadata, never trust a client "to".
+        const receipt = await receipts.record(data.messageId, socket.data.auth.chatId, status);
+        if (typeof ack === "function") ack({ ok: true, applied: Boolean(receipt) });
+      } catch (error) {
+        console.error("Receipt update failed:", error.message);
+        if (typeof ack === "function") ack({ ok: false });
       }
-    }
-  });
+    });
+  }
 
-  socket.on("message_read", async (data) => {
-    if (!socket.data.auth?.chatId) return;
-    if (!data?.messageId || !data?.to) return;
-    data.from = normalizeChatId(socket.data.auth.chatId);
-    data.type = "message_read";
-    const to = await resolveGhostReceiverId(data.to);
-    const room = to.ghostInvalid ? data.to : to.receiverChatId;
-    const cleanRoom = normalizeChatId(room);
-    const cleanFrom = normalizeChatId(data.from);
-
+  socket.on("set_presence", async (data) => {
+    if (!socket.data.auth?.chatId || typeof data?.foreground !== "boolean") return;
+    socket.data.foreground = data.foreground;
     try {
-      const reader = await User.findOne({ chatId: { $in: [cleanFrom, data.from] } }).select("privacy").lean();
-      const targetUser = await User.findOne({ chatId: { $in: [cleanRoom, to.receiverChatId] } }).select("privacy").lean();
-      if (reader?.privacy?.readReceipts === false || targetUser?.privacy?.readReceipts === false) {
-        return; // Reciprocal privacy: hide read receipt
+      const chatId = normalizeChatId(socket.data.auth.chatId);
+      if (!await isPresent(io, chatId)) {
+        await User.updateOne({ _id: socket.data.auth.sub }, { $set: { lastSeen: new Date() } });
       }
-    } catch (_) {}
-
-    Message.updateOne(
-      { $or: [{ messageId: data.messageId }, { clientMessageId: data.messageId }] },
-      { $set: { status: "read" } }
-    ).catch(() => {});
-
-    const roomsToEmit = new Set([cleanRoom, room, `user:${cleanRoom}`, `user:${room}`]);
-    for (const r of roomsToEmit) {
-      if (r) io.to(r).emit("message_read", data);
-    }
-    const userSockets = onlineUsers.get(cleanRoom) || onlineUsers.get(room);
-    if (userSockets) {
-      for (const sId of userSockets) {
-        io.to(sId).emit("message_read", data);
-      }
+      await publishPresence(chatId);
+    } catch (error) {
+      console.error("Presence update failed:", error.message);
     }
   });
 
@@ -6680,28 +6714,27 @@ io.on("connection", (socket) => {
     console.log("Socket disconnected:", socket.id);
 
     if (chatId) {
-      const stillOnline = onlineUsers.has(chatId) && onlineUsers.get(chatId).size > 0;
-      if (!stillOnline) {
+      const cleanChatId = normalizeChatId(chatId);
+      const remainingSockets = await io.in(`user:${cleanChatId}`).fetchSockets();
+      const stillOnline = remainingSockets.some((peer) => peer.data.foreground !== false);
+      if (remainingSockets.length === 0) {
         removeParticipantFromRooms(chatId, socket, { temporary: true });
+        if (cleanChatId && cleanChatId !== chatId) {
+          removeParticipantFromRooms(cleanChatId, socket, { temporary: true });
+        }
         for (const call of activePeerCalls.values()) {
           if (call.callerId === chatId || call.calleeId === chatId) {
             schedulePeerDisconnectGrace(call, chatId);
           }
         }
       }
-      const nowIso = new Date().toISOString();
-      const presencePayload = {
-        chatId,
-        isOnline: stillOnline,
-        lastSeen: stillOnline ? null : nowIso,
-        serverNow: nowIso,
-      };
-      io.to(`user:${chatId}`).emit("presence_changed", presencePayload);
-      io.to(presenceRoom(chatId)).emit("presence_changed", presencePayload);
       try {
         await User.updateOne(
-          { chatId, socketId: socket.id },
-          { $set: { socketId: null, lastSeen: new Date() } },
+          { chatId: { $in: [chatId, cleanChatId, `@${cleanChatId}`].filter(Boolean) } },
+          { $set: stillOnline ? {} : {
+            socketId: null,
+            ...(socket.data.foreground !== false ? { lastSeen: new Date() } : {}),
+          } },
         );
         if (deviceId) {
           await Device.updateOne(
@@ -6709,6 +6742,7 @@ io.on("connection", (socket) => {
             { $set: { socketId: null, lastActive: new Date() } },
           );
         }
+        await publishPresence(chatId);
       } catch (e) {
         console.error("Socket disconnect DB update failed:", e);
       }
@@ -6749,7 +6783,12 @@ async function bootstrapServer() {
   initializeFirebaseAdmin();
   ensureUpdateConfig();
 
-  // Bind to PORT immediately so Cloud Run / App Hosting TCP and health probes pass instantly
+  await connectMongo();
+  if (redisUrl) {
+    socketRedisClients = await setupSocketRedisAdapter(io, redisUrl);
+  }
+
+  // Accept traffic only after persistence and cross-worker routing are ready.
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`Convoo E2EE Server running on port ${PORT} (pid ${process.pid})`);
   });
@@ -6776,19 +6815,7 @@ async function bootstrapServer() {
     );
   }, 5 * 60 * 1000);
 
-  // Initialize DB and Redis connections asynchronously without blocking HTTP readiness
-  try {
-    await connectMongo();
-  } catch (err) {
-    console.error("MongoDB initial connection error:", err.message);
-  }
 
-  if (redisUrl) {
-    socketRedisClients = await setupSocketRedisAdapter(io, redisUrl).catch((e) => {
-      console.warn("Socket Redis adapter failed:", e.message);
-      return null;
-    });
-  }
 }
 
 bootstrapServer().catch((error) => {

@@ -166,7 +166,13 @@ function registerGlobalErrorHandlers(app) {
 function runCluster(startWorker) {
   const isContainer = Boolean(process.env.K_SERVICE || process.env.PORT);
   const defaultWorkers = isContainer ? 1 : os.cpus().length;
-  const workers = Number(process.env.CLUSTER_WORKERS || defaultWorkers);
+  // Without a shared adapter, requests and sockets on different workers cannot
+  // reach each other. Run one worker instead of silently dropping chat events.
+  const requestedWorkers = Number(process.env.CLUSTER_WORKERS || defaultWorkers);
+  const workers = process.env.REDIS_URL ? requestedWorkers : 1;
+  if (requestedWorkers > 1 && workers === 1) {
+    console.warn("Using one worker: REDIS_URL is required for realtime clustering");
+  }
   if (workers <= 1) {
     startWorker();
     return;
